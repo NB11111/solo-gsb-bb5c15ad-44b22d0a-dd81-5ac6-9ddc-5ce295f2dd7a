@@ -38,6 +38,11 @@
   大小，允许迟到秒数也不得随时改），避免同组窗口时间范围或封存时点错开导致组汇总
   失真；提交与所属组完全相同的配置是幂等重复提交，返回 200。未入组设备沿用既有规则
   （已有窗口数据后不得改窗口大小，允许迟到秒数可随时调整）。
+- 未入组设备缩短允许迟到秒数时，PUT config 在同一写事务内按新阈值封存
+  watermark >= window_end + 新迟到秒数 的已有 open 窗口并记录 sealed_at，
+  恢复"水位线越过封存条件即封存"的不变量；只有实际封存才推进窗口检索的状态
+  筛选变更版本（进行中的 status 筛选翻页返回 409，未筛状态的游标不受影响），
+  调长迟到期限绝不重开已封存窗口；此后落入新封存窗口的事件按 late 修正处理。
 - 旧库组成员纠偏：提交值与所有所属组一致时，写入前在同一写锁事务内核对该设备
   已有窗口的起点对齐与实际跨度；任一窗口与目标 window_size_seconds 不相容
   （漂移期间落盘的异网格窗口）即返回 409，设备配置、窗口与组汇总保持原样；
@@ -832,6 +837,36 @@ def get_search_change_versions(
     return {d: found.get(d, 0) for d in dimensions}
 
 
+def seal_overdue_windows(
+    conn: sqlite3.Connection,
+    device_id: str,
+    lateness: int,
+    watermark: Optional[float],
+    now: str,
+) -> int:
+    """封存设备所有满足 watermark >= window_end + lateness 的 open 窗口，返回封存行数。
+
+    ingest 写入路径与 PUT config 缩短允许迟到秒数共用的同一封存口径：只把 open
+    转为 sealed 并记录 sealed_at，绝不反向重开已封存窗口。确有窗口被封存时才在
+    同一事务内推进窗口检索的状态筛选维度变更版本，使进行中的 status 筛选翻页
+    核对到版本变化并返回 409；未筛状态的游标本就不绑定该版本，不受影响。
+    （预演路径整体回滚，封存与版本推进也随之回滚，不留痕。）
+    """
+    if watermark is None:
+        return 0
+    cur = conn.execute(
+        "UPDATE windows SET status = 'sealed', sealed_at = ?"
+        " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
+        (now, device_id, lateness, watermark),
+    )
+    sealed = cur.rowcount
+    if sealed > 0:
+        # 确有窗口从 open 转为 sealed：推进状态筛选维度的变更版本，与封存在同一
+        # 事务提交；进行中的 status 筛选翻页将核对到版本变化并返回 409。
+        bump_search_change_version(conn, SEARCH_DIMENSION_STATUS)
+    return sealed
+
+
 # ---------- 设备组工具 ----------
 
 def placeholders(n: int) -> str:
@@ -1401,7 +1436,7 @@ def _run_ingest_batch(
             watermark = t
         results.append(EventResult(event_id=ev.event_id, status=status, window_start=to_iso(w_start)))
 
-    # 持久化水位线，并封存所有越过允许迟到窗口的窗口
+    # 持久化水位线
     conn.execute(
         "UPDATE devices SET watermark = ? WHERE device_id = ?",
         (watermark, req.device_id),
@@ -1422,16 +1457,8 @@ def _run_ingest_batch(
             ).fetchall()
         )
 
-    seal_cur = conn.execute(
-        "UPDATE windows SET status = 'sealed', sealed_at = ?"
-        " WHERE device_id = ? AND status = 'open' AND window_end + ? <= ?",
-        (now, req.device_id, lateness, watermark),
-    )
-    if seal_cur.rowcount > 0:
-        # 本批确有窗口从 open 转为 sealed：推进状态筛选维度的变更版本，与封存在同一
-        # 事务提交；进行中的 status 筛选翻页将核对到版本变化并返回 409。
-        # （预演路径整体回滚，版本推进也随之回滚，不留痕。）
-        bump_search_change_version(conn, SEARCH_DIMENSION_STATUS)
+    # 封存所有越过允许迟到窗口的 open 窗口；确有封存时同事务推进状态筛选变更版本
+    seal_overdue_windows(conn, req.device_id, lateness, watermark, now)
 
     # 窗口封存 / 迟到修正后，仅对本批实际发生变化的窗口增量重算该设备所在组的汇总；
     # 无变化的历史窗口不参与本次写入对账（组创建时的全量初始化仍遍历全部历史窗口）。
@@ -1527,7 +1554,11 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
     """创建或更新设备配置。
 
     - 未入组设备沿用既有规则：已有窗口数据后不允许修改窗口大小（避免历史窗口口径
-      不一致），允许迟到秒数可随时调整。
+      不一致），允许迟到秒数可随时调整。缩短允许迟到秒数时，在同一写事务内按新阈值
+      封存 watermark >= window_end + 新迟到秒数 的已有 open 窗口并记录 sealed_at，
+      恢复"水位线越过封存条件即封存"的不变量；调长迟到期限绝不重开已封存窗口，
+      此后落入新封存窗口的事件按 late 修正处理。只有实际封存了窗口才推进窗口检索的
+      状态筛选变更版本（进行中的 status 筛选翻页将返回 409，未筛状态的游标不受影响）。
     - 已入组设备的窗口大小与允许迟到秒数必须与**每一个所属组**保持一致：
       任一组的窗口配置不同即返回 409 且不写入——即使该设备尚无任何窗口也不得改窗口
       大小（否则同组 window_start 时间范围错开），允许迟到秒数同样不得随时改
@@ -1543,6 +1574,7 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
     与同样持写锁的 POST /groups 串行化：组创建的成员校验与设备配置更新不可能交错，
     不会留下"已入组但配置漂移"的成员。
     """
+    now = utcnow_iso()
     # BEGIN IMMEDIATE：与组创建互斥，保证成员配置校验与设备配置更新串行
     with db.immediate_session() as conn:
         dev = get_device(conn, device_id)
@@ -1550,7 +1582,7 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
             conn.execute(
                 "INSERT INTO devices (device_id, window_size_seconds, allowed_lateness_seconds, watermark, created_at)"
                 " VALUES (?, ?, ?, NULL, ?)",
-                (device_id, cfg.window_size_seconds, cfg.allowed_lateness_seconds, utcnow_iso()),
+                (device_id, cfg.window_size_seconds, cfg.allowed_lateness_seconds, now),
             )
         else:
             groups = device_group_rows(conn, device_id)
@@ -1616,6 +1648,14 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
                 conn.execute(
                     "UPDATE devices SET window_size_seconds = ?, allowed_lateness_seconds = ? WHERE device_id = ?",
                     (cfg.window_size_seconds, cfg.allowed_lateness_seconds, device_id),
+                )
+                # 缩短允许迟到秒数后，水位线可能已越过部分仍 open 窗口的新封存阈值：
+                # 在同一写事务内按新阈值封存这些窗口（记录 sealed_at），恢复
+                # "watermark >= window_end + allowed_lateness_seconds 即封存"的不变量。
+                # 只触碰 open 窗口——调长迟到期限不会重开任何已封存窗口；没有窗口
+                # 满足新阈值时为空操作，也不会推进状态筛选变更版本。
+                seal_overdue_windows(
+                    conn, device_id, cfg.allowed_lateness_seconds, dev["watermark"], now
                 )
         return device_out(conn, device_id)
 

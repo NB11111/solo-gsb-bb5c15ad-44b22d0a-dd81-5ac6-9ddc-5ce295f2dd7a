@@ -6,7 +6,7 @@
 
 - **水位线（watermark）**：每个设备维护一条持久化的事件时间水位线，等于该设备已见最大 `event_time`，单调递增、落盘保存，重启不丢失。
 - **时间窗**：按 `window_size_seconds`（默认 60s）对齐 epoch 的滚动窗口，按设备独立维护。
-- **窗口封存**：当 `watermark >= window_end + allowed_lateness_seconds`（默认 30s）时，窗口状态从 `open` 变为 `sealed`。
+- **窗口封存**：当 `watermark >= window_end + allowed_lateness_seconds`（默认 30s）时，窗口状态从 `open` 变为 `sealed`。未入组设备通过 `PUT /devices/{id}/config` 缩短 `allowed_lateness_seconds` 时，会在同一写事务内按新阈值补封存水位线已越过的已有 `open` 窗口（记录 `sealed_at`）；调长不会重开已封存窗口。
 - **幂等去重**：同一 `(device_id, event_id)` 重复提交只生效一次，返回 `duplicate`，不影响聚合结果。
 - **迟到修正**：窗口封存后到达的事件标记为 `late`，仍计入窗口聚合，同时生成一条修正记录（correction），窗口的 `correction_count` 递增。
 - 批次内事件按提交顺序处理，与流式处理语义一致。
@@ -213,7 +213,7 @@ curl -X PUT http://localhost:8000/devices/sensor-001/config \
   -d '{"window_size_seconds": 60, "allowed_lateness_seconds": 30}'
 ```
 
-> **未入组设备**已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整。**已入组设备**的两项配置均锁定为所属组配置：提交与任一所属组不一致的值——包括成员尚无窗口时改窗口大小、或随时改允许迟到秒数——一律返回 `409` 且不写入，以防同组窗口时间范围或封存时点错开、组汇总失真；提交完全相同的配置为幂等重复提交（`200`，也可借此把配置纠正回组配置）。**旧库纠偏**：提交值与所有所属组一致时，写入前会在同一写锁事务内核对该设备已有窗口的起点对齐与实际跨度，任一窗口与目标 `window_size_seconds` 不相容（旧库漂移期间落盘的异网格窗口）同样返回 `409`，设备配置、窗口与组汇总保持原样；无冲突时才允许纠正仅配置字段的历史漂移。组创建校验与设备配置更新都在 `BEGIN IMMEDIATE` 写锁事务内串行完成。
+> **未入组设备**已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整：缩短时同一写事务内会按新阈值封存 `watermark >= window_end + 新值` 的已有 `open` 窗口（记录 `sealed_at`，确有封存才推进窗口检索的状态筛选变更版本，进行中的 `status` 筛选翻页将返回 409），之后落入这些新封存窗口的事件按 `late` 修正处理；调长不会重开已封存窗口。**已入组设备**的两项配置均锁定为所属组配置：提交与任一所属组不一致的值——包括成员尚无窗口时改窗口大小、或随时改允许迟到秒数——一律返回 `409` 且不写入，以防同组窗口时间范围或封存时点错开、组汇总失真；提交完全相同的配置为幂等重复提交（`200`，也可借此把配置纠正回组配置）。**旧库纠偏**：提交值与所有所属组一致时，写入前会在同一写锁事务内核对该设备已有窗口的起点对齐与实际跨度，任一窗口与目标 `window_size_seconds` 不相容（旧库漂移期间落盘的异网格窗口）同样返回 `409`，设备配置、窗口与组汇总保持原样；无冲突时才允许纠正仅配置字段的历史漂移。组创建校验与设备配置更新都在 `BEGIN IMMEDIATE` 写锁事务内串行完成。
 
 ### 2. 提交事件批次
 
@@ -891,7 +891,7 @@ curl 'http://localhost:8000/devices/sensor-001/integrity?start=2026-09-22T10:00:
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/ingest` | 按设备提交事件批次（幂等） |
 | `POST` | `/ingest/preview` | 预演批次提交（dry-run；与 /ingest 同请求体与判断口径，返回逐事件 accepted/duplicate/late、预计水位线及触及窗口预演后的 count/sum/status/correction_count；同快照按序推进，事务一律回滚不留任何写入） |
-| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置（未入组设备有数据后禁改窗口大小；已入组设备两项均须与所属组一致，冲突 409 不写入，相同配置幂等 200；提交值与组一致时先核对已有窗口起点对齐/实际跨度，不相容 409 且配置/窗口/组汇总原样；写锁事务） |
+| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置（未入组设备有数据后禁改窗口大小；缩短允许迟到秒数时同事务按新阈值封存水位线已越过的 open 窗口并记录 sealed_at，调长不重开已封存窗口；已入组设备两项均须与所属组一致，冲突 409 不写入，相同配置幂等 200；提交值与组一致时先核对已有窗口起点对齐/实际跨度，不相容 409 且配置/窗口/组汇总原样；写锁事务） |
 | `GET` | `/devices` | 设备列表，支持 `?label_key=&label_value=` 按当前标签筛选 |
 | `GET` | `/devices/{device_id}` | 设备水位线与统计 |
 | `PUT` | `/devices/{device_id}/labels` | 全量替换设备标签（≤20 个键值对，键名规范化，版本 +1，支持 `if_version` 乐观并发，冲突 409） |
@@ -928,6 +928,7 @@ tests/
   test_labels.py    # 设备标签测试（规范化/重复键/版本递增/乐观并发/标签筛选/旧库迁移）
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_group_config_drift.py # 旧库组成员配置漂移纠偏测试（漂移窗口起点错格/跨度不符 409 且配置/窗口/组汇总原样、仅配置字段漂移可纠正、组不一致仍拒绝、未入组设备规则不变）
+  test_config_lateness_seal.py # 未入组设备缩短允许迟到秒数的封存测试（同事务封存越过新阈值的 open 窗口并记录 sealed_at、阈值取等、调长不重开、实际封存才推进状态筛选版本致 status 游标 409、无筛选游标不受影响、新封存窗口后续事件按 late 修正）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
   test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 打分、MAD=0、404/409/422、只读）
   test_windows_search.py # 跨设备窗口检索测试（时间范围/状态/标签筛选、游标分页稳定性、翻页间相关维度变化 409、无关变化不失效、400/422、只读）
